@@ -14,6 +14,9 @@ import (
 	"github.com/jeduden/mdsmith/internal/piparser"
 	"github.com/jeduden/mdsmith/internal/yamlutil"
 	"github.com/jeduden/mdsmith/pkg/goldmark/ast"
+	"github.com/jeduden/mdsmith/pkg/goldmark/parser"
+	"github.com/jeduden/mdsmith/pkg/goldmark/text"
+	"github.com/jeduden/mdsmith/pkg/goldmark/util"
 )
 
 // FileReader resolves a schema path or include reference to the
@@ -696,13 +699,46 @@ func protoTokenRegex(text string) string {
 	return b.String()
 }
 
+// HeadingText returns the plain text of a heading node as schema
+// matching sees it: inline markup is dropped and a trailing heading
+// attribute list such as "{#id}" is stripped.
+func HeadingText(h *ast.Heading, source []byte) string {
+	return headingText(h, source)
+}
+
 // headingText extracts the plain text content of a heading node.
 func headingText(h *ast.Heading, source []byte) string {
 	var buf strings.Builder
 	for c := h.FirstChild(); c != nil; c = c.NextSibling() {
 		writeNodeText(c, source, &buf)
 	}
-	return buf.String()
+	return StripHeadingAttributes(buf.String())
+}
+
+// StripHeadingAttributes removes a trailing attribute list such as
+// "{#id .class key=value}" from heading text, plus the whitespace
+// before it. It uses goldmark's own attribute parser, so it accepts
+// the same syntax as goldmark's heading-attribute option: the first
+// "{" whose attribute list parses and runs to the end of the text.
+// Text without such a list is returned unchanged.
+func StripHeadingAttributes(s string) string {
+	if !strings.HasSuffix(s, "}") {
+		return s
+	}
+	for i := strings.IndexByte(s, '{'); i >= 0; {
+		r := text.NewReader([]byte(s[i:]))
+		if _, ok := parser.ParseAttributes(r); ok {
+			if rest, _ := r.PeekLine(); rest == nil || util.IsBlank(rest) {
+				return strings.TrimRight(s[:i], " \t")
+			}
+		}
+		next := strings.IndexByte(s[i+1:], '{')
+		if next < 0 {
+			break
+		}
+		i += 1 + next
+	}
+	return s
 }
 
 func writeNodeText(n ast.Node, source []byte, buf *strings.Builder) {
