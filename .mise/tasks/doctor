@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#MISE description="Check that go and the mdsmith binary run, read only (mise run -q doctor -- --json)"
+# Fork only (thoka/mdsmith); not part of upstream pull requests.
+# Format: meta docs/research/tool-protocol.md, section 6. Exit 0 when the
+# doctor ran; the JSON status says whether the checks pass.
+set -u
+json=0
+for a in "$@"; do
+  case "$a" in
+    --json) json=1 ;;
+    *) echo "usage: doctor [--json]" >&2; exit 2 ;;
+  esac
+done
+
+checks=()
+worst=pass
+add() { # name status message [fix]
+  local fix=null; [ -n "${4:-}" ] && fix="\"$4\""
+  local msg=${3//\\/\\\\}; msg=${msg//\"/\\\"}
+  checks+=("{\"name\":\"$1\",\"status\":\"$2\",\"type\":\"urn:dv:mdsmith:doctor:$1\",\"message\":\"$msg\",\"fix\":$fix}")
+  [ "$2" = fail ] && worst=fail
+  echo "doctor: $1: $2: $3" >&2
+}
+
+echo "doctor: checks go" >&2
+if v=$(go version 2>&1); then add go pass "$v"; else add go fail "go does not run: $v" "mise install"; fi
+
+echo "doctor: builds and runs mdsmith" >&2
+if v=$(go run ./cmd/mdsmith version 2>&1); then add mdsmith pass "$v"; else add mdsmith fail "mdsmith does not build or run: ${v##*$'\n'}" "go build ./cmd/mdsmith"; fi
+
+if [ "$json" = 1 ]; then
+  ver=$(git describe --tags --always 2>/dev/null || echo unknown)
+  (IFS=,; printf '{"tool":"mdsmith","version":"%s","status":"%s","checks":[%s]}\n' "$ver" "$worst" "${checks[*]}")
+else
+  echo "mdsmith doctor: $worst"
+fi
+exit 0
