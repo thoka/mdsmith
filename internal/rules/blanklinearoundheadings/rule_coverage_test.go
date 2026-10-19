@@ -14,28 +14,28 @@ import (
 
 func TestIsNonBlankLine_NonBlank(t *testing.T) {
 	lines := [][]byte{[]byte("hello")}
-	assert.True(t, isNonBlankLine(lines, 0))
+	assert.True(t, isNonBlankLine(lines, 0, false))
 }
 
 func TestIsNonBlankLine_Blank(t *testing.T) {
 	lines := [][]byte{[]byte(""), []byte("   "), []byte("  \t  ")}
-	assert.False(t, isNonBlankLine(lines, 0))
-	assert.False(t, isNonBlankLine(lines, 1))
-	assert.False(t, isNonBlankLine(lines, 2))
+	assert.False(t, isNonBlankLine(lines, 0, false))
+	assert.False(t, isNonBlankLine(lines, 1, false))
+	assert.False(t, isNonBlankLine(lines, 2, false))
 }
 
 func TestIsNonBlankLine_OutOfBoundsNegative(t *testing.T) {
 	lines := [][]byte{[]byte("hello")}
-	assert.False(t, isNonBlankLine(lines, -1))
+	assert.False(t, isNonBlankLine(lines, -1, false))
 }
 
 func TestIsNonBlankLine_OutOfBoundsPositive(t *testing.T) {
 	lines := [][]byte{[]byte("hello")}
-	assert.False(t, isNonBlankLine(lines, 1))
+	assert.False(t, isNonBlankLine(lines, 1, false))
 }
 
 func TestIsNonBlankLine_EmptySlice(t *testing.T) {
-	assert.False(t, isNonBlankLine(nil, 0))
+	assert.False(t, isNonBlankLine(nil, 0, false))
 }
 
 // --- headingLastLine coverage ---
