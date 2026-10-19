@@ -1,0 +1,11 @@
+# Fork only (thoka/mdsmith); not part of upstream pull requests.
+[tools]
+go = "1.25.11"
+
+[env]
+# git answers in English, which TestStageGitattributes_* expects.
+LC_ALL = "C"
+
+[tasks.test]
+description = "Run the Go test suite"
+run = "go test ./..."
