@@ -92,3 +92,53 @@ func TestSkipSpacesBack(t *testing.T) {
 	assert.Equal(t, 0, skipSpacesBack([]byte("  x"), 2))
 	assert.Equal(t, 1, skipSpacesBack(src, 1))
 }
+
+// parseFirstList parses src and returns its first list and the source
+// line the list starts on.
+func parseFirstList(t *testing.T, src string) (*ast.List, []byte) {
+	t.Helper()
+	f, err := lint.NewFile("test.md", []byte(src))
+	require.NoError(t, err)
+	var l *ast.List
+	_ = ast.Walk(f.AST, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if ll, ok := n.(*ast.List); ok && entering && l == nil {
+			l = ll
+			return ast.WalkStop, nil
+		}
+		return ast.WalkContinue, nil
+	})
+	require.NotNil(t, l, "no list in %q", src)
+	start := -1
+	_ = ast.Walk(l, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
+		if entering && n.Type() == ast.TypeBlock && n.Lines().Len() > 0 {
+			start = n.Lines().At(0).Start
+			return ast.WalkStop, nil
+		}
+		return ast.WalkContinue, nil
+	})
+	require.GreaterOrEqual(t, start, 0, "list without lines in %q", src)
+	return l, f.Lines[f.LineOfOffset(start)-1]
+}
+
+func TestQuoteBlankLine(t *testing.T) {
+	cases := map[string]string{
+		"- a\n":           "",
+		"> - a\n":         ">",
+		"> > - a\n":       "> >",
+		"- > - a\n":       "", // the outer list is not quoted
+		">> 1. a\n":       ">>",
+		"> - > - a\n":     ">",
+		"  > * a\n":       "  >",
+		"> text\n> - a\n": ">",
+	}
+	for src, want := range cases {
+		l, line := parseFirstList(t, src)
+		assert.Equal(t, want, string(QuoteBlankLine(l, line)), "source %q", src)
+	}
+}
+
+func TestQuoteBlankLine_MissingMarker(t *testing.T) {
+	l, _ := parseFirstList(t, "> - a\n")
+	assert.Nil(t, QuoteBlankLine(l, []byte("- a")),
+		"a line without the quote marker yields nil")
+}
