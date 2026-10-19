@@ -5,8 +5,10 @@ import (
 
 	"github.com/jeduden/mdsmith/internal/lint"
 	"github.com/jeduden/mdsmith/internal/rule"
+	"github.com/jeduden/mdsmith/internal/rules/astutil"
 	"github.com/jeduden/mdsmith/internal/rules/listscan"
 	"github.com/jeduden/mdsmith/pkg/goldmark/ast"
+	"github.com/jeduden/mdsmith/pkg/markdown/flavor"
 )
 
 func init() {
@@ -50,7 +52,7 @@ func (r *Rule) checkLayer0(f *lint.File) []lint.Diagnostic {
 		if !l.TopLevel {
 			continue
 		}
-		diags = append(diags, r.verdict(f, codeLines, l.FirstLine, l.LastLine)...)
+		diags = append(diags, r.verdict(f, codeLines, l.FirstLine, l.LastLine, false)...)
 	}
 	return diags
 }
@@ -73,14 +75,21 @@ func (r *Rule) CheckNode(n ast.Node, entering bool, f *lint.File) []lint.Diagnos
 	if _, isListItem := list.Parent().(*ast.ListItem); isListItem {
 		return nil
 	}
-	return r.verdict(f, lint.CollectCodeBlockLines(f), lineOfNode(f, list), lastLineOfNode(f, list))
+	start := lineOfNode(f, list)
+	quoted := quoteBlankLine(f, list, start) != nil
+	return r.verdict(f, lint.CollectCodeBlockLines(f), start, lastLineOfNode(f, list), quoted)
 }
 
 // verdict is the shared per-list check both the AST (CheckNode) and Layer
 // 0 (checkLayer0) paths drive: listStartLine and listEndLine are the
 // top-level list's 1-based first and last source lines. A list whose edge
-// sits inside a code block is skipped, matching the AST path.
-func (r *Rule) verdict(f *lint.File, codeLines map[int]struct{}, listStartLine, listEndLine int) []lint.Diagnostic {
+// sits inside a code block is skipped, matching the AST path. quoted
+// reports that the list sits in a block quote, where a line of only `>`
+// markers is a blank line. A source with a block quote always takes the
+// AST path, so the Layer 0 path passes false.
+func (r *Rule) verdict(
+	f *lint.File, codeLines map[int]struct{}, listStartLine, listEndLine int, quoted bool,
+) []lint.Diagnostic {
 	if listStartLine <= 0 || listEndLine <= 0 {
 		return nil
 	}
@@ -88,10 +97,10 @@ func (r *Rule) verdict(f *lint.File, codeLines map[int]struct{}, listStartLine, 
 		return nil
 	}
 	var diags []lint.Diagnostic
-	if d, ok := r.checkAdjacentBlank(f, listStartLine, -1, "list should be preceded by a blank line"); ok {
+	if d, ok := r.checkAdjacentBlank(f, listStartLine, -1, quoted, "list should be preceded by a blank line"); ok {
 		diags = append(diags, d)
 	}
-	if d, ok := r.checkAdjacentBlank(f, listEndLine, +1, "list should be followed by a blank line"); ok {
+	if d, ok := r.checkAdjacentBlank(f, listEndLine, +1, quoted, "list should be followed by a blank line"); ok {
 		diags = append(diags, d)
 	}
 	return diags
@@ -101,13 +110,10 @@ var _ rule.NodeChecker = (*Rule)(nil)
 
 // checkAdjacentBlank checks whether the line adjacent to targetLine (offset -1 for before,
 // +1 for after) is non-blank and returns a diagnostic if so.
-func (r *Rule) checkAdjacentBlank(f *lint.File, targetLine, direction int, msg string) (lint.Diagnostic, bool) {
-	totalLines := len(f.Lines)
-	adjLine := targetLine + direction
-	if adjLine < 1 || adjLine > totalLines {
-		return lint.Diagnostic{}, false
-	}
-	if isBlank(f.Lines[adjLine-1]) {
+func (r *Rule) checkAdjacentBlank(
+	f *lint.File, targetLine, direction int, quoted bool, msg string,
+) (lint.Diagnostic, bool) {
+	if !needsBlankAdjacent(f, targetLine, direction, quoted) {
 		return lint.Diagnostic{}, false
 	}
 	return lint.Diagnostic{
@@ -196,8 +202,24 @@ func lastLineOfNode(f *lint.File, n ast.Node) int {
 	return 0
 }
 
-func isBlank(line []byte) bool {
+// isBlank reports whether line is blank. When quoted, the line's block
+// quote markers are stripped first, so a line of only `>` markers is
+// blank.
+func isBlank(line []byte, quoted bool) bool {
+	if quoted {
+		line = flavor.StripBlockquoteMarkers(line)
+	}
 	return len(bytes.TrimSpace(line)) == 0
+}
+
+// quoteBlankLine returns the blank line to insert next to list, whose
+// first source line is the 1-based line: the list's block quote markers
+// (astutil.QuoteBlankLine), or nil outside a block quote.
+func quoteBlankLine(f *lint.File, list *ast.List, line int) []byte {
+	if line < 1 || line > len(f.Lines) {
+		return nil
+	}
+	return astutil.QuoteBlankLine(list, f.Lines[line-1])
 }
 
 // lineInSet reports whether the 1-based line is a member of set. It
@@ -221,23 +243,25 @@ func (r *Rule) Fix(f *lint.File) []byte {
 	resultLines := make([][]byte, 0, len(f.Lines)+len(beforeSet)+len(afterSet))
 	for i, line := range f.Lines {
 		lineNum := i + 1
-		if _, ok := beforeSet[lineNum]; ok {
-			resultLines = append(resultLines, []byte{})
+		if blank, ok := beforeSet[lineNum]; ok {
+			resultLines = append(resultLines, blank)
 		}
 		resultLines = append(resultLines, line)
-		if _, ok := afterSet[lineNum]; ok {
-			resultLines = append(resultLines, []byte{})
+		if blank, ok := afterSet[lineNum]; ok {
+			resultLines = append(resultLines, blank)
 		}
 	}
 
 	return bytes.Join(resultLines, newlineSep)
 }
 
-// collectBlankLineInsertions walks the AST and returns sets of 1-based line numbers
-// that need a blank line inserted before or after them.
-func (r *Rule) collectBlankLineInsertions(f *lint.File) (beforeSet, afterSet map[int]struct{}) {
-	beforeSet = make(map[int]struct{})
-	afterSet = make(map[int]struct{})
+// collectBlankLineInsertions walks the AST and returns maps from 1-based
+// line numbers that need a blank line inserted before or after them to
+// the blank line to insert: nil at the top level, or the list's block
+// quote markers (quoteBlankLine) so the quote is not split.
+func (r *Rule) collectBlankLineInsertions(f *lint.File) (beforeSet, afterSet map[int][]byte) {
+	beforeSet = make(map[int][]byte)
+	afterSet = make(map[int][]byte)
 	codeLines := lint.CollectCodeBlockLines(f)
 
 	_ = ast.Walk(f.AST, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
@@ -261,11 +285,13 @@ func (r *Rule) collectBlankLineInsertions(f *lint.File) (beforeSet, afterSet map
 			return ast.WalkContinue, nil
 		}
 
-		if needsBlankAdjacent(f, listStartLine, -1) {
-			beforeSet[listStartLine] = struct{}{}
+		blank := quoteBlankLine(f, list, listStartLine)
+		quoted := blank != nil
+		if needsBlankAdjacent(f, listStartLine, -1, quoted) {
+			beforeSet[listStartLine] = blank
 		}
-		if needsBlankAdjacent(f, listEndLine, +1) {
-			afterSet[listEndLine] = struct{}{}
+		if needsBlankAdjacent(f, listEndLine, +1, quoted) {
+			afterSet[listEndLine] = blank
 		}
 
 		return ast.WalkContinue, nil
@@ -276,12 +302,13 @@ func (r *Rule) collectBlankLineInsertions(f *lint.File) (beforeSet, afterSet map
 
 // needsBlankAdjacent returns true if the line adjacent to targetLine
 // (direction -1 for before, +1 for after) exists and is non-blank.
-func needsBlankAdjacent(f *lint.File, targetLine, direction int) bool {
+// quoted makes a line of only `>` markers count as blank.
+func needsBlankAdjacent(f *lint.File, targetLine, direction int, quoted bool) bool {
 	adjLine := targetLine + direction
 	if adjLine < 1 || adjLine > len(f.Lines) {
 		return false
 	}
-	return !isBlank(f.Lines[adjLine-1])
+	return !isBlank(f.Lines[adjLine-1], quoted)
 }
 
 // FixTitle implements rule.QuickFixTitler.
