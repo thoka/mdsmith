@@ -1948,30 +1948,10 @@ func buildDocHeadings(f *lint.File) any {
 }
 
 // headingText extracts the plain text content of a heading node.
+// It delegates to schema.HeadingText so the legacy proto.md path and
+// the schema package strip markup and attribute lists the same way.
 func headingText(h *ast.Heading, source []byte) string {
-	var buf strings.Builder
-	for c := h.FirstChild(); c != nil; c = c.NextSibling() {
-		writeNodeText(c, source, &buf)
-	}
-	return buf.String()
-}
-
-// writeNodeText recursively writes the text content of an AST node.
-func writeNodeText(n ast.Node, source []byte, buf *strings.Builder) {
-	if t, ok := n.(*ast.Text); ok {
-		buf.Write(t.Segment.Value(source))
-		return
-	}
-	if _, ok := n.(*ast.CodeSpan); ok {
-		// Code spans store text in child nodes.
-		for c := n.FirstChild(); c != nil; c = c.NextSibling() {
-			writeNodeText(c, source, buf)
-		}
-		return
-	}
-	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
-		writeNodeText(c, source, buf)
-	}
+	return schema.HeadingText(h, source)
 }
 
 // headingMatchesLine checks if a docHeading matches a raw heading line.
@@ -1979,7 +1959,7 @@ func headingMatchesLine(h docHeading, line string) bool {
 	// Strip leading # and spaces.
 	stripped := strings.TrimLeft(line, "#")
 	stripped = strings.TrimSpace(stripped)
-	return stripped == h.Text
+	return schema.StripHeadingAttributes(stripped) == h.Text
 }
 
 // checkStructure verifies required headings are present and in order.
