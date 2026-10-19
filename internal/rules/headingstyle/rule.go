@@ -7,6 +7,7 @@ import (
 
 	"github.com/jeduden/mdsmith/internal/lint"
 	"github.com/jeduden/mdsmith/internal/rule"
+	"github.com/jeduden/mdsmith/internal/rules/astutil"
 	"github.com/jeduden/mdsmith/pkg/goldmark/ast"
 	"github.com/jeduden/mdsmith/pkg/goldmark/text"
 )
@@ -192,6 +193,14 @@ func buildStyleReplacement(heading *ast.Heading, source []byte, style string) (r
 	}
 
 	if style == "setext" && isATX && heading.Level <= 2 {
+		// The underline goes on a new line, which must repeat the
+		// heading's container prefix (block quote markers, list
+		// indentation) to stay in the same container.
+		lineStart := start
+		for lineStart > 0 && source[lineStart-1] != '\n' {
+			lineStart--
+		}
+		cont := astutil.ContinuationPrefix(source[lineStart:start])
 		underChar := "="
 		if heading.Level == 2 {
 			underChar = "-"
@@ -200,7 +209,7 @@ func buildStyleReplacement(heading *ast.Heading, source []byte, style string) (r
 		if len(hText) == 0 {
 			underline = strings.Repeat(underChar, 3)
 		}
-		return replacement{start: start, end: end, newText: hText + "\n" + underline}, true
+		return replacement{start: start, end: end, newText: hText + "\n" + string(cont) + underline}, true
 	}
 
 	return replacement{}, false
@@ -213,9 +222,10 @@ func isATXHeading(heading *ast.Heading, source []byte) bool {
 		return isATXHeadingNoLines(heading, source)
 	}
 
-	// If Lines() > 0, it could be setext. Check if the source line starts with #.
-	seg := lines.At(0)
-	return lineStartsWithHash(source, seg.Start)
+	// If Lines() > 0, it could be setext. An ATX heading's content
+	// segment follows its `#` run; reading the marker back from the
+	// segment keeps a block quote or list prefix out of the way.
+	return astutil.HeadingIsATX(heading, source)
 }
 
 // isATXHeadingNoLines determines ATX style for headings with no Lines() entries,
@@ -313,8 +323,17 @@ func headingByteRange(heading *ast.Heading, source []byte) (int, int) {
 	}
 
 	// Go to the start of the line
-	for start > 0 && source[start-1] != '\n' {
-		start--
+	lineStart := start
+	for lineStart > 0 && source[lineStart-1] != '\n' {
+		lineStart--
+	}
+	start = lineStart
+	// Inside a container (block quote, list item) the range starts after
+	// the container prefix, so the replacement keeps it. Plain
+	// indentation stays in the range, as before.
+	if end, ok := astutil.HeadingPrefixEnd(heading, source); ok &&
+		len(bytes.TrimSpace(source[lineStart:end])) > 0 {
+		start = end
 	}
 
 	isATX := isATXHeading(heading, source)
