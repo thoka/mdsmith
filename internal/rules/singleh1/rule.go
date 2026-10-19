@@ -314,33 +314,30 @@ type rep struct {
 }
 
 // buildDemoteReplacement returns the byte replacement needed to demote an
-// H1 to H2. ATX: inserts a '#' after any leading spaces and the existing
-// '#' run. Setext: replaces the '=' underline with '-'.
+// H1 to H2. ATX: inserts a '#' before the existing '#' run, after any
+// container prefix (block quote markers, list markers, indentation).
+// Setext: replaces the '=' underline with '-'.
 func buildDemoteReplacement(heading *ast.Heading, source []byte) (rep, bool) {
 	lineStart := headingLineStart(heading, source)
 	if lineStart < 0 {
 		return rep{}, false
 	}
-	if isATXHeadingAt(lineStart, source) {
-		end := lineStart
-		for end < len(source) && source[end] != '\n' {
-			end++
+	if astutil.HeadingIsATX(heading, source) {
+		if end, ok := astutil.HeadingPrefixEnd(heading, source); ok {
+			return rep{start: end, end: end, newText: "#"}, true
 		}
-		line := source[lineStart:end]
-		// Skip up to 3 CommonMark-allowed leading spaces, then the '#' run.
-		i := 0
-		for i < 3 && i < len(line) && line[i] == ' ' {
+		// No Lines: the '#' run starts after up to 3 CommonMark-allowed
+		// leading spaces.
+		i := lineStart
+		for i < lineStart+3 && i < len(source) && source[i] == ' ' {
 			i++
 		}
-		for i < len(line) && line[i] == '#' {
-			i++
-		}
-		newText := string(line[:i]) + "#" + string(line[i:])
-		return rep{start: lineStart, end: end, newText: newText}, true
+		return rep{start: i, end: i, newText: "#"}, true
 	}
 
-	// Setext heading: replace the underline line '===...' with '---...'
-	textEnd := lineStart
+	// Setext heading: replace the underline line '===...' with '---...'.
+	// The underline follows the last content line.
+	textEnd := heading.Lines().At(heading.Lines().Len() - 1).Start
 	for textEnd < len(source) && source[textEnd] != '\n' {
 		textEnd++
 	}
@@ -351,19 +348,7 @@ func buildDemoteReplacement(heading *ast.Heading, source []byte) (rep, bool) {
 	}
 	underlineContent := source[underlineStart:underlineEnd]
 	newUnderline := strings.ReplaceAll(string(underlineContent), "=", "-")
-	newText := string(source[lineStart:underlineStart]) + newUnderline
-	return rep{start: lineStart, end: underlineEnd, newText: newText}, true
-}
-
-// isATXHeadingAt checks whether source at lineStart begins with an ATX
-// heading marker (0-3 leading spaces then '#').
-func isATXHeadingAt(lineStart int, source []byte) bool {
-	spaces := 0
-	for spaces < 3 && lineStart+spaces < len(source) && source[lineStart+spaces] == ' ' {
-		spaces++
-	}
-	pos := lineStart + spaces
-	return pos < len(source) && source[pos] == '#'
+	return rep{start: underlineStart, end: underlineEnd, newText: newUnderline}, true
 }
 
 // headingLineStart returns the byte offset of the start of the line
