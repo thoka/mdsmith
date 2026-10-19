@@ -5,8 +5,10 @@ import (
 
 	"github.com/jeduden/mdsmith/internal/lint"
 	"github.com/jeduden/mdsmith/internal/rule"
+	"github.com/jeduden/mdsmith/internal/rules/astutil"
 	"github.com/jeduden/mdsmith/internal/rules/fencepos"
 	"github.com/jeduden/mdsmith/pkg/goldmark/ast"
+	"github.com/jeduden/mdsmith/pkg/markdown/flavor"
 )
 
 // newlineSep is the bytes.Join separator; a package-level var avoids
@@ -56,15 +58,19 @@ func (r *Rule) CheckNode(n ast.Node, entering bool, f *lint.File) []lint.Diagnos
 	openStart, openEnd := fencepos.OpenLineRange(f.Source, fcb)
 	closeStart, _ := fencepos.CloseLineRange(f.Source, fcb, openEnd)
 
-	return r.checkBlanks(f, f.LineOfOffset(openStart), f.LineOfOffset(closeStart))
+	openLine := f.LineOfOffset(openStart)
+	quoted := quoteBlankLine(f, fcb, openLine) != nil
+	return r.checkBlanks(f, openLine, f.LineOfOffset(closeStart), quoted)
 }
 
 // CheckBlock implements rule.BlockChecker. A BlockFencedCode span's Start
 // is the opening fence line and End the closing fence line — the same
 // open/close lines fencepos resolves on the AST path — so the blank-line
-// verdict is byte-identical.
+// verdict is byte-identical. A source with a block quote always takes
+// the AST path (lint.SourceMayHaveBlockQuote), so a Layer 0 fence is
+// never quoted.
 func (r *Rule) CheckBlock(span lint.BlockSpan, f *lint.File) []lint.Diagnostic {
-	return r.checkBlanks(f, span.Start, span.End)
+	return r.checkBlanks(f, span.Start, span.End, false)
 }
 
 // blockKinds is the static block-kind interest CheckBlock declares via
@@ -79,15 +85,16 @@ var _ rule.BlockChecker = (*Rule)(nil)
 
 // checkBlanks is the shared per-block check both the AST (CheckNode) and
 // Layer 0 (CheckBlock) paths drive: openLine is the 1-based opening fence
-// line, closeLine the closing fence line.
-func (r *Rule) checkBlanks(f *lint.File, openLine, closeLine int) []lint.Diagnostic {
+// line, closeLine the closing fence line. quoted reports that the block
+// sits in a block quote, where a line of only `>` markers is blank.
+func (r *Rule) checkBlanks(f *lint.File, openLine, closeLine int, quoted bool) []lint.Diagnostic {
 	var diags []lint.Diagnostic
 
 	// Check blank line before opening fence
 	if openLine > 1 {
 		prevLineIdx := openLine - 2 // 0-based index of the line before
 		if prevLineIdx >= 0 && prevLineIdx < len(f.Lines) {
-			if !isBlank(f.Lines[prevLineIdx]) {
+			if !isBlank(f.Lines[prevLineIdx], quoted) {
 				diags = append(diags, lint.Diagnostic{
 					File:     f.Path,
 					Line:     openLine,
@@ -105,7 +112,7 @@ func (r *Rule) checkBlanks(f *lint.File, openLine, closeLine int) []lint.Diagnos
 	closeLineIdx := closeLine - 1 // 0-based index of closing fence line
 	nextLineIdx := closeLineIdx + 1
 	if nextLineIdx < len(f.Lines) {
-		if !isBlank(f.Lines[nextLineIdx]) {
+		if !isBlank(f.Lines[nextLineIdx], quoted) {
 			diags = append(diags, lint.Diagnostic{
 				File:     f.Path,
 				Line:     closeLine,
@@ -133,23 +140,25 @@ func (r *Rule) Fix(f *lint.File) []byte {
 	result := make([][]byte, 0, len(f.Lines)+len(insertBeforeLine)+len(insertAfterLine))
 	for i, line := range f.Lines {
 		lineNum := i + 1
-		if _, ok := insertBeforeLine[lineNum]; ok {
-			result = append(result, nil)
+		if blank, ok := insertBeforeLine[lineNum]; ok {
+			result = append(result, blank)
 		}
 		result = append(result, line)
-		if _, ok := insertAfterLine[lineNum]; ok {
-			result = append(result, nil)
+		if blank, ok := insertAfterLine[lineNum]; ok {
+			result = append(result, blank)
 		}
 	}
 
 	return bytes.Join(result, newlineSep)
 }
 
-// collectFenceBlankLineInsertions walks the AST and returns sets of 1-based line
-// numbers that need a blank line inserted before or after them.
-func collectFenceBlankLineInsertions(f *lint.File) (beforeSet, afterSet map[int]struct{}) {
-	beforeSet = make(map[int]struct{})
-	afterSet = make(map[int]struct{})
+// collectFenceBlankLineInsertions walks the AST and returns maps from
+// 1-based line numbers that need a blank line inserted before or after
+// them to the blank line to insert: nil at the top level, or the block's
+// quote markers (quoteBlankLine) so the quote is not split.
+func collectFenceBlankLineInsertions(f *lint.File) (beforeSet, afterSet map[int][]byte) {
+	beforeSet = make(map[int][]byte)
+	afterSet = make(map[int][]byte)
 
 	_ = ast.Walk(f.AST, func(n ast.Node, entering bool) (ast.WalkStatus, error) {
 		if !entering {
@@ -166,11 +175,13 @@ func collectFenceBlankLineInsertions(f *lint.File) (beforeSet, afterSet map[int]
 		openLine := f.LineOfOffset(openStart)
 		closeLine := f.LineOfOffset(closeStart)
 
-		if needsBlankBefore(f, openLine) {
-			beforeSet[openLine] = struct{}{}
+		blank := quoteBlankLine(f, fcb, openLine)
+		quoted := blank != nil
+		if needsBlankBefore(f, openLine, quoted) {
+			beforeSet[openLine] = blank
 		}
-		if needsBlankAfter(f, closeLine) {
-			afterSet[closeLine] = struct{}{}
+		if needsBlankAfter(f, closeLine, quoted) {
+			afterSet[closeLine] = blank
 		}
 
 		return ast.WalkContinue, nil
@@ -181,23 +192,39 @@ func collectFenceBlankLineInsertions(f *lint.File) (beforeSet, afterSet map[int]
 
 // needsBlankBefore returns true if the line before the given 1-based line
 // exists and is non-blank.
-func needsBlankBefore(f *lint.File, line int) bool {
+func needsBlankBefore(f *lint.File, line int, quoted bool) bool {
 	if line <= 1 {
 		return false
 	}
 	prevIdx := line - 2
-	return prevIdx >= 0 && prevIdx < len(f.Lines) && !isBlank(f.Lines[prevIdx])
+	return prevIdx >= 0 && prevIdx < len(f.Lines) && !isBlank(f.Lines[prevIdx], quoted)
 }
 
 // needsBlankAfter returns true if the line after the given 1-based line
 // exists and is non-blank.
-func needsBlankAfter(f *lint.File, line int) bool {
+func needsBlankAfter(f *lint.File, line int, quoted bool) bool {
 	nextIdx := line // 0-based index of the next line
-	return nextIdx < len(f.Lines) && !isBlank(f.Lines[nextIdx])
+	return nextIdx < len(f.Lines) && !isBlank(f.Lines[nextIdx], quoted)
 }
 
-func isBlank(line []byte) bool {
+// isBlank reports whether line is blank. When quoted, the line's block
+// quote markers are stripped first, so a line of only `>` markers is
+// blank.
+func isBlank(line []byte, quoted bool) bool {
+	if quoted {
+		line = flavor.StripBlockquoteMarkers(line)
+	}
 	return len(bytes.TrimSpace(line)) == 0
+}
+
+// quoteBlankLine returns the blank line to insert next to fcb, whose
+// opening fence is on the 1-based line: the block's quote markers
+// (astutil.QuoteBlankLine), or nil outside a block quote.
+func quoteBlankLine(f *lint.File, fcb *ast.FencedCodeBlock, line int) []byte {
+	if line < 1 || line > len(f.Lines) {
+		return nil
+	}
+	return astutil.QuoteBlankLine(fcb, f.Lines[line-1])
 }
 
 // FixTitle implements rule.QuickFixTitler.

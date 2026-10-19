@@ -65,6 +65,30 @@ func ContinuationPrefix(prefix []byte) []byte {
 	return out
 }
 
+// QuoteBlankLine returns the line to insert as a blank line next to the
+// block n so that the new line stays inside every block quote that holds
+// n. line is n's first source line, which carries one `>` marker per
+// enclosing quote. The result is line's prefix up to the marker of the
+// innermost quote, mapped by ContinuationPrefix. It returns nil when no
+// block quote holds n, so a bare blank line is right.
+func QuoteBlankLine(n ast.Node, line []byte) []byte {
+	depth := 0
+	for p := n.Parent(); p != nil; p = p.Parent() {
+		if p.Kind() == ast.KindBlockquote {
+			depth++
+		}
+	}
+	for i := 0; depth > 0 && i < len(line); i++ {
+		if line[i] == '>' {
+			depth--
+			if depth == 0 {
+				return ContinuationPrefix(line[:i+1])
+			}
+		}
+	}
+	return nil
+}
+
 // skipSpacesBack returns the offset before the run of spaces and tabs
 // that ends at i on the same line.
 func skipSpacesBack(source []byte, i int) int {
