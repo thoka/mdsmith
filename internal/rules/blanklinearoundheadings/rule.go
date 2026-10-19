@@ -7,6 +7,7 @@ import (
 	"github.com/jeduden/mdsmith/internal/rule"
 	"github.com/jeduden/mdsmith/internal/rules/astutil"
 	"github.com/jeduden/mdsmith/pkg/goldmark/ast"
+	"github.com/jeduden/mdsmith/pkg/markdown/flavor"
 )
 
 func init() {
@@ -65,7 +66,7 @@ func (r *Rule) CheckNode(n ast.Node, entering bool, f *lint.File) []lint.Diagnos
 		return nil
 	}
 	lastLine := headingLastLine(heading, f)
-	return r.checkBlankLines(f, line, lastLine)
+	return r.checkBlankLines(f, line, lastLine, headingQuoted(heading, f.Source))
 }
 
 // CheckBlock implements rule.BlockChecker. A heading span's 1-based
@@ -74,8 +75,10 @@ func (r *Rule) CheckNode(n ast.Node, entering bool, f *lint.File) []lint.Diagnos
 // line itself for ATX — matching headingLastLine. The Layer 0 scanner
 // never emits a heading span for a line inside a code block, so the
 // AST path's code-line skip has no nil-AST counterpart to reproduce.
+// A source with a block quote always takes the AST path
+// (lint.SourceMayHaveBlockQuote), so a Layer 0 heading is never quoted.
 func (r *Rule) CheckBlock(span lint.BlockSpan, f *lint.File) []lint.Diagnostic {
-	return r.checkBlankLines(f, span.Start, span.End)
+	return r.checkBlankLines(f, span.Start, span.End, false)
 }
 
 // blockKinds is the static block-kind interest CheckBlock declares via
@@ -91,15 +94,17 @@ var _ rule.BlockChecker = (*Rule)(nil)
 
 // checkBlankLines is the shared per-heading check both the AST
 // (CheckNode) and Layer 0 (CheckBlock) paths drive: line is the 1-based
-// first heading line, lastLine its 1-based last line.
-func (r *Rule) checkBlankLines(f *lint.File, line, lastLine int) []lint.Diagnostic {
+// first heading line, lastLine its 1-based last line. quoted reports
+// that the heading sits in a block quote, where a line of only `>`
+// markers is a blank line.
+func (r *Rule) checkBlankLines(f *lint.File, line, lastLine int, quoted bool) []lint.Diagnostic {
 	var diags []lint.Diagnostic
 
 	// Check blank line before (not needed for line 1)
 	if line > 1 {
 		prevLineIdx := line - 2 // 0-based index
 		if prevLineIdx >= 0 && prevLineIdx < len(f.Lines) {
-			if len(bytes.TrimSpace(f.Lines[prevLineIdx])) != 0 {
+			if isNonBlankLine(f.Lines, prevLineIdx, quoted) {
 				diags = append(diags, lint.Diagnostic{
 					File:     f.Path,
 					Line:     line,
@@ -116,7 +121,7 @@ func (r *Rule) checkBlankLines(f *lint.File, line, lastLine int) []lint.Diagnost
 	// Check blank line after (not needed for last line)
 	nextLineIdx := lastLine // 0-based index of line after heading
 	if nextLineIdx < len(f.Lines) {
-		if len(bytes.TrimSpace(f.Lines[nextLineIdx])) != 0 {
+		if isNonBlankLine(f.Lines, nextLineIdx, quoted) {
 			diags = append(diags, lint.Diagnostic{
 				File:     f.Path,
 				Line:     line,
@@ -146,29 +151,31 @@ func (r *Rule) Fix(f *lint.File) []byte {
 	result := make([][]byte, 0, len(f.Lines)+len(insertBefore)+len(insertAfter))
 	for i, line := range f.Lines {
 		lineNum := i + 1
-		if _, ok := insertBefore[lineNum]; ok {
+		if blank, ok := insertBefore[lineNum]; ok {
 			// Avoid inserting a blank line if one was just inserted
 			// after the previous line (prevents double blank lines).
 			if _, ok2 := insertAfter[lineNum-1]; !ok2 {
-				result = append(result, nil)
+				result = append(result, blank)
 			}
 		}
 		result = append(result, line)
-		if _, ok := insertAfter[lineNum]; ok {
-			result = append(result, nil)
+		if blank, ok := insertAfter[lineNum]; ok {
+			result = append(result, blank)
 		}
 	}
 
 	return bytes.Join(result, newlineSep)
 }
 
-// collectHeadingBlankLineInsertions walks the AST and returns sets of 1-based
-// line numbers that need a blank line inserted before or after them. Insertion
-// decisions are made directly inside the walk to avoid an intermediate slice
-// and its growth allocations.
-func collectHeadingBlankLineInsertions(f *lint.File) (insertBefore, insertAfter map[int]struct{}) {
-	insertBefore = make(map[int]struct{})
-	insertAfter = make(map[int]struct{})
+// collectHeadingBlankLineInsertions walks the AST and returns maps from
+// 1-based line numbers that need a blank line inserted before or after
+// them to the blank line to insert: nil at the top level, or the
+// heading's block quote markers (blankLineFor) so the quote is not
+// split. Insertion decisions are made directly inside the walk to avoid
+// an intermediate slice and its growth allocations.
+func collectHeadingBlankLineInsertions(f *lint.File) (insertBefore, insertAfter map[int][]byte) {
+	insertBefore = make(map[int][]byte)
+	insertAfter = make(map[int][]byte)
 	codeLines := lint.CollectCodeBlockLines(f)
 	lines := f.Lines
 
@@ -185,11 +192,12 @@ func collectHeadingBlankLineInsertions(f *lint.File) (insertBefore, insertAfter 
 			return ast.WalkContinue, nil
 		}
 		lastLine := headingLastLine(heading, f)
-		if line > 1 && isNonBlankLine(lines, line-2) {
-			insertBefore[line] = struct{}{}
+		quoted := headingQuoted(heading, f.Source)
+		if line > 1 && isNonBlankLine(lines, line-2, quoted) {
+			insertBefore[line] = blankLineFor(heading, f.Source)
 		}
-		if isNonBlankLine(lines, lastLine) {
-			insertAfter[lastLine] = struct{}{}
+		if isNonBlankLine(lines, lastLine, quoted) {
+			insertAfter[lastLine] = blankLineFor(heading, f.Source)
 		}
 		return ast.WalkContinue, nil
 	})
@@ -198,12 +206,49 @@ func collectHeadingBlankLineInsertions(f *lint.File) (insertBefore, insertAfter 
 }
 
 // isNonBlankLine returns true if the 0-based index is within bounds and the
-// line is non-blank.
-func isNonBlankLine(lines [][]byte, idx int) bool {
+// line is non-blank. When quoted, the line's block quote markers are
+// stripped first, so a line of only `>` markers is blank.
+func isNonBlankLine(lines [][]byte, idx int, quoted bool) bool {
 	if idx < 0 || idx >= len(lines) {
 		return false
 	}
-	return len(bytes.TrimSpace(lines[idx])) != 0
+	line := lines[idx]
+	if quoted {
+		line = flavor.StripBlockquoteMarkers(line)
+	}
+	return len(bytes.TrimSpace(line)) != 0
+}
+
+// headingPrefix returns the container prefix of the heading's first
+// line (block quote markers, list markers, indentation), or nil when it
+// is unknown.
+func headingPrefix(heading *ast.Heading, source []byte) []byte {
+	end, ok := astutil.HeadingPrefixEnd(heading, source)
+	if !ok {
+		return nil
+	}
+	start := end
+	for start > 0 && source[start-1] != '\n' {
+		start--
+	}
+	return source[start:end]
+}
+
+// headingQuoted reports whether the heading's line carries a block
+// quote marker in its container prefix.
+func headingQuoted(heading *ast.Heading, source []byte) bool {
+	return bytes.IndexByte(headingPrefix(heading, source), '>') >= 0
+}
+
+// blankLineFor returns the blank line to insert next to heading: its
+// container prefix with list markers turned into spaces and trailing
+// whitespace dropped. That keeps the block quote markers, so the new
+// line stays inside the quote, and is nil outside a quote.
+func blankLineFor(heading *ast.Heading, source []byte) []byte {
+	if !headingQuoted(heading, source) {
+		return nil
+	}
+	return bytes.TrimRight(astutil.ContinuationPrefix(headingPrefix(heading, source)), " \t")
 }
 
 func headingLastLine(heading *ast.Heading, f *lint.File) int {
@@ -227,15 +272,7 @@ func isSetextHeading(heading *ast.Heading, source []byte) bool {
 	if lines.Len() == 0 {
 		return false
 	}
-	seg := lines.At(0)
-	lineStart := seg.Start
-	for lineStart > 0 && source[lineStart-1] != '\n' {
-		lineStart--
-	}
-	if lineStart < len(source) && source[lineStart] == '#' {
-		return false
-	}
-	return true
+	return !astutil.HeadingIsATX(heading, source)
 }
 
 var _ rule.FixableRule = (*Rule)(nil)
