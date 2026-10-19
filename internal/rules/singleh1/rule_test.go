@@ -324,7 +324,7 @@ func TestFrontMatterHasTitle_EmptyBody(t *testing.T) {
 }
 
 // TestCheck_IndentedATXHeading exercises the leading-space handling in
-// isATXHeadingAt and buildDemoteReplacement for CommonMark-allowed indented ATX.
+// buildDemoteReplacement for CommonMark-allowed indented ATX.
 func TestCheck_IndentedATXHeading(t *testing.T) {
 	// CommonMark allows 1-3 spaces before the # marker.
 	src := "# First\n\n  # Second\n"
