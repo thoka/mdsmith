@@ -66,3 +66,9 @@ func TestCheck_InlineSchemaRegexHeadingAttrListStripped(t *testing.T) {
 		"# Plan\n\n## Hand-off {#JbWv0EAr}\n\nText.\n")
 	assert.Empty(t, r.Check(f))
 }
+
+func TestHeadingMatchesLine_AttrList(t *testing.T) {
+	h := docHeading{Level: 2, Text: "Goal"}
+	assert.True(t, headingMatchesLine(h, "## Goal {#goal}"))
+	assert.False(t, headingMatchesLine(h, "## Goal {draft}"))
+}
